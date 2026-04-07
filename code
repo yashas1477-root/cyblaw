@@ -1,1 +1,602 @@
+"""
+X.509 Certificate Parsing – Offensive Security Research Toolkit
 
+Implements the 5 core algorithms from THEME-16 report for use in
+AUTHORIZED penetration testing / bug-bounty / academic research.
+
+  Module 1 – Differential Fuzzing Objective     (Eq. 1–2)
+  Module 2 – CGF Energy / Markov Chain          (Eq. 3–4)
+  Module 3 – Jaccard Distance Metric            (Eq. 5–6)
+  Module 4 – Directed Greybox Fuzzing Distance  (Eq. 7–8)
+  Module 5 – Metaheuristic Threshold Opt.       (Eq. 9 : PSO + GWO)
+
+NOTE: Run only against systems you own or have explicit written
+      permission to test.  Unauthorised use is illegal.
+"""
+
+import os
+import math
+import random
+import hashlib
+import subprocess
+import struct
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SHARED TYPES
+# ═══════════════════════════════════════════════════════════════════════════
+
+OUTCOMES = ("ACCEPT", "REJECT", "CRASH", "TIMEOUT")
+
+@dataclass
+class Cert:
+    data: bytes
+    label: str = ""
+    def __hash__(self):  return hash(self.data)
+    def __eq__(self, o): return isinstance(o, Cert) and self.data == o.data
+
+ValidatorFn = Callable[[Cert], str]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODULE 1 – DIFFERENTIAL FUZZING OBJECTIVE  (Eq. 1 & 2)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#   Eq. 1 : max  |{ R(I_k, c*)  :  k ∈ [n] }|
+#   Eq. 2 :      ∃ I_j, I_k  :  R(I_j, c*) ≠ R(I_k, c*)
+#
+# Strategy: feed the same malformed certificate to N validators,
+# collect outcomes, flag any disagreement as a potential vuln.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_disagreement(validators: Dict[str, ValidatorFn],
+                     cert: Cert) -> Tuple[int, Dict[str, str]]:
+    """
+    Eq. 1 – returns (distinct_outcome_count, {name: outcome}).
+    score > 1  →  Eq. 2 satisfied  →  parsing divergence found.
+    """
+    results = {name: fn(cert) for name, fn in validators.items()}
+    return len(set(results.values())), results
+
+
+def sweep_corpus(validators: Dict[str, ValidatorFn],
+                 corpus: List[Cert]) -> List[Tuple[Cert, Dict[str, str]]]:
+    """
+    Run all validators over every cert in corpus.
+    Returns list of (cert, results) where divergence was detected.
+    """
+    hits = []
+    for cert in corpus:
+        score, results = run_disagreement(validators, cert)
+        if score > 1:
+            hits.append((cert, results))
+    return hits
+
+
+# ── Real-world validator wrappers (subprocess-based) ──────────────────────
+
+def openssl_validator(cert: Cert) -> str:
+    """
+    Invoke system OpenSSL to validate DER-encoded cert bytes.
+    Requires: openssl CLI installed.
+    """
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".der", delete=False) as f:
+        f.write(cert.data)
+        tmp = f.name
+    try:
+        result = subprocess.run(
+            ["openssl", "x509", "-in", tmp, "-inform", "DER",
+             "-noout", "-text"],
+            capture_output=True, timeout=5
+        )
+        if result.returncode == 0:
+            return "ACCEPT"
+        stderr = result.stderr.decode(errors="replace").lower()
+        if "unable to load" in stderr or "error" in stderr:
+            return "REJECT"
+        return "REJECT"
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT"
+    except Exception:
+        return "CRASH"
+    finally:
+        os.unlink(tmp)
+
+
+# ── DER / ASN.1 Corpus Generators (edge-case inputs from §V TCEV-2) ──────
+
+def generate_edge_case_certs() -> List[Cert]:
+    """
+    Produces malformed DER structures that target TCEV-2 parsing logic.
+    Each cert targets a known divergence class.
+    """
+    certs = []
+
+    # 1. Null-byte injection in the certificate body (Common Name exploit)
+    certs.append(Cert(
+        b"\x30\x82\x01\x00" + b"\x00" * 10 + b"\xff" * 20,
+        "null_byte_injection"
+    ))
+    # 2. Non-DER BER encoding (indefinite length)
+    certs.append(Cert(
+        b"\x30\x80" + b"\x02\x01\x01" + b"\x00\x00",
+        "ber_indefinite_length"
+    ))
+    # 3. Negative serial number
+    certs.append(Cert(
+        b"\x30\x0f\x02\x04\xff\x00\x00\x01" + b"\x30\x07" + b"\x00" * 7,
+        "negative_serial"
+    ))
+    # 4. Zero-length subject field
+    certs.append(Cert(
+        b"\x30\x06\x30\x00\x03\x02\x00\x00",
+        "zero_length_subject"
+    ))
+    # 5. Oversized certificate (overflow trigger)
+    certs.append(Cert(
+        b"\x30\x84\xff\xff\xff\xff" + os.urandom(512),
+        "length_overflow"
+    ))
+    # 6. Unknown critical extension
+    certs.append(Cert(
+        b"\x30\x15\x06\x03\x55\x04\x03\x01\x01\xff" + b"\x55" * 11,
+        "unknown_critical_extension"
+    ))
+    # 7. Path-length constraint abuse
+    certs.append(Cert(
+        b"\x30\x09\x30\x07\x01\x01\xff\x02\x02\x00\x00",
+        "path_length_constraint_abuse"
+    ))
+    return certs
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODULE 2 – CGF ENERGY / MARKOV CHAIN  (Eq. 3 & 4)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#   Eq. 3 : E(s)    = α / ρ(p(s))
+#   Eq. 4 : ρ(p)    = |{s' ∈ S : p(s')=p}| / |S|
+#
+# Rare execution paths get high energy → more mutations.
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class FuzzSeed:
+    cert: Cert
+    path_id: str = ""
+    mutations_applied: int = 0
+
+
+def compute_path_id(cert: Cert) -> str:
+    """SHA-1 prefix as a proxy execution-path fingerprint."""
+    return hashlib.sha1(cert.data).hexdigest()[:12]
+
+
+def path_density(seed: FuzzSeed, pool: List[FuzzSeed]) -> float:
+    """Eq. 4 – fraction of seeds sharing this path."""
+    if not pool:
+        return 0.0
+    return sum(1 for s in pool if s.path_id == seed.path_id) / len(pool)
+
+
+def seed_energy(seed: FuzzSeed, pool: List[FuzzSeed],
+                alpha: float = 1.0) -> float:
+    """Eq. 3 – rare paths → high energy → prioritised for mutation."""
+    rho = path_density(seed, pool)
+    return alpha / rho if rho > 0 else float("inf")
+
+
+# ── Mutation strategies targeting X.509 parse surfaces ──────────────────
+
+def mutate(cert: Cert, strategy: str = "random") -> Cert:
+    data = bytearray(cert.data)
+    n = len(data)
+    if n == 0:
+        return cert
+
+    if strategy == "random":
+        # Flip random bytes
+        for i in random.sample(range(n), k=max(1, n // 20)):
+            data[i] ^= random.randint(1, 255)
+
+    elif strategy == "length_tamper":
+        # Overwrite length fields (bytes 2–5 in DER TLV)
+        if n > 5:
+            for i in range(1, min(6, n)):
+                data[i] = random.randint(0, 255)
+
+    elif strategy == "tag_flip":
+        # Flip ASN.1 tag bytes (every 4th byte is likely a tag)
+        for i in range(0, n, 4):
+            data[i] ^= 0x20  # toggle constructed bit
+
+    elif strategy == "null_inject":
+        # Insert null bytes at random positions
+        pos = random.randint(0, n - 1)
+        data[pos] = 0x00
+
+    return Cert(bytes(data), cert.label + f"_{strategy}")
+
+
+STRATEGIES = ["random", "length_tamper", "tag_flip", "null_inject"]
+
+
+def cgf_fuzz_loop(validators: Dict[str, ValidatorFn],
+                  initial_corpus: List[Cert],
+                  iterations: int = 200,
+                  alpha: float = 1.0) -> List[Tuple[Cert, Dict[str, str]]]:
+    """
+    Full CGF loop (Eq. 3–4).
+    Returns all (cert, validator_results) pairs where divergence found.
+    """
+    pool: List[FuzzSeed] = [
+        FuzzSeed(cert=c, path_id=compute_path_id(c))
+        for c in initial_corpus
+    ]
+    divergent: List[Tuple[Cert, Dict[str, str]]] = []
+
+    for i in range(iterations):
+        # Energy-weighted seed selection
+        energies = [min(seed_energy(s, pool, alpha), 1e6) for s in pool]
+        total = sum(energies)
+        probs = [e / total for e in energies]
+        chosen = random.choices(pool, weights=probs, k=1)[0]
+
+        # Pick mutation strategy (rotate through all)
+        strategy = STRATEGIES[i % len(STRATEGIES)]
+        mutant = mutate(chosen.cert, strategy)
+        new_seed = FuzzSeed(cert=mutant, path_id=compute_path_id(mutant))
+        pool.append(new_seed)
+
+        # Check for disagreement
+        score, results = run_disagreement(validators, mutant)
+        if score > 1:
+            divergent.append((mutant, results))
+
+    return divergent
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODULE 3 – JACCARD DISTANCE METRIC  (Eq. 5 & 6)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#   Eq. 5 : J(Ij,Ik)   = |Aj ∩ Ak| / |Aj ∪ Ak|
+#   Eq. 6 : D_J(Ij,Ik) = 1 − J
+#
+#   Decision boundary (paper §IV.C):
+#     D_J ∈ [0.22,0.35] → shallow fuzzers / minor inconsistency
+#     D_J ∈ [0.68,0.81] → deep fuzzers  / exploitable gap
+#     D_J ≈ 0.50        → security boundary
+# ═══════════════════════════════════════════════════════════════════════════
+
+BOUNDARY = 0.50
+
+def jaccard_distance(a: Set, b: Set) -> float:
+    """Eq. 6 – D_J(Ij, Ik)."""
+    if not a and not b:
+        return 0.0
+    union = len(a | b)
+    return len(a ^ b) / union if union else 0.0
+
+
+def risk_label(dj: float) -> str:
+    if dj < 0.35:   return "LOW    – minor parsing quirk"
+    if dj < 0.50:   return "MEDIUM – approaching security boundary"
+    if dj < 0.68:   return "HIGH   – security boundary exceeded"
+    return              "CRITICAL – systematically exploitable gap"
+
+
+def pairwise_jaccard_matrix(validators: Dict[str, ValidatorFn],
+                             corpus: List[Cert]
+                             ) -> Dict[Tuple[str, str], float]:
+    """
+    Build the full D_J matrix for all validator pairs.
+    Acceptance sets are computed over the provided corpus.
+    """
+    acceptance: Dict[str, Set[Cert]] = {n: set() for n in validators}
+    for cert in corpus:
+        for name, fn in validators.items():
+            if fn(cert) == "ACCEPT":
+                acceptance[name].add(cert)
+
+    from itertools import combinations
+    return {
+        (n1, n2): jaccard_distance(acceptance[n1], acceptance[n2])
+        for n1, n2 in combinations(validators, 2)
+    }
+
+
+def print_jaccard_report(matrix: Dict[Tuple[str, str], float]):
+    print("\n── Jaccard Distance Matrix (Eq. 5–6) ──────────────────────")
+    for (v1, v2), dj in sorted(matrix.items(), key=lambda x: -x[1]):
+        bar = "█" * int(dj * 30)
+        print(f"  {v1:12s} ↔ {v2:12s}  D_J={dj:.4f}  {bar}")
+        print(f"  {'':>27}  Risk: {risk_label(dj)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODULE 4 – DIRECTED GREYBOX FUZZING DISTANCE  (Eq. 7 & 8)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#   Eq. 7 : d_f(b,T)  = (1/|T|) * Σ_{t∈T} d(b,t)   [block→target mean]
+#   Eq. 8 : d_s(s,T)  = (1/|s|) * Σ_{b∈s} d_f(b,T) [seed trace mean]
+#
+# Use: prioritise seeds whose execution traces are closest to
+# dangerous parse functions (e.g. validate_san, parse_extensions).
+# ═══════════════════════════════════════════════════════════════════════════
+
+CallGraph = Dict[str, List[str]]
+
+
+def bfs_distance(graph: CallGraph, start: str, end: str,
+                 sentinel: int = 100) -> int:
+    """BFS shortest path; returns sentinel if unreachable."""
+    if start == end:
+        return 0
+    visited, queue = {start}, [(start, 0)]
+    while queue:
+        node, depth = queue.pop(0)
+        for nb in graph.get(node, []):
+            if nb == end:
+                return depth + 1
+            if nb not in visited:
+                visited.add(nb)
+                queue.append((nb, depth + 1))
+    return sentinel
+
+
+def block_distance(block: str, targets: List[str],
+                   graph: CallGraph) -> float:
+    """Eq. 7 – mean distance from block to all targets."""
+    if not targets:
+        return 0.0
+    return sum(bfs_distance(graph, block, t) for t in targets) / len(targets)
+
+
+def seed_distance(trace: List[str], targets: List[str],
+                  graph: CallGraph) -> float:
+    """Eq. 8 – mean block distance of a seed's execution trace."""
+    if not trace:
+        return float("inf")
+    return sum(block_distance(b, targets, graph) for b in trace) / len(trace)
+
+
+def rank_seeds_by_distance(seeds_with_traces: List[Tuple[FuzzSeed, List[str]]],
+                            targets: List[str],
+                            graph: CallGraph
+                            ) -> List[Tuple[float, FuzzSeed]]:
+    """
+    Rank seeds: lowest d_s = closest to vulnerable code = highest priority.
+    """
+    ranked = [
+        (seed_distance(trace, targets, graph), seed)
+        for seed, trace in seeds_with_traces
+    ]
+    return sorted(ranked, key=lambda x: x[0])
+
+
+# ── Sample X.509 parse call-graph (extend with real CFG data) ────────────
+
+X509_CALL_GRAPH: CallGraph = {
+    "tls_handshake":        ["parse_certificate_message"],
+    "parse_certificate_message": ["parse_tbscert", "verify_signature"],
+    "parse_tbscert":        ["parse_version", "parse_serial",
+                             "parse_issuer", "parse_validity",
+                             "parse_subject", "parse_spki",
+                             "parse_extensions"],
+    "parse_extensions":     ["parse_san", "parse_key_usage",
+                             "parse_basic_constraints",
+                             "parse_unknown_ext"],
+    "parse_san":            ["validate_san_value"],
+    "parse_key_usage":      ["enforce_key_usage"],
+    "parse_basic_constraints": ["validate_path_length"],
+    "parse_unknown_ext":    ["handle_critical_ext"],
+    "verify_signature":     ["check_revocation"],
+    "check_revocation":     ["query_ocsp", "check_crl"],
+}
+
+# Targets: functions where divergences are most dangerous
+DANGEROUS_TARGETS = [
+    "validate_san_value",
+    "handle_critical_ext",
+    "validate_path_length",
+    "query_ocsp",
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODULE 5 – METAHEURISTIC THRESHOLD OPTIMISATION  (Eq. 9)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#   Eq. 9:  θ* = argmax_θ  F(θ)
+#           F(θ) = w1·DR(θ) − w2·FPR(θ) − w3·C(θ)
+#           s.t.  w1+w2+w3=1,  DR ≥ δ_DR,  FPR ≤ δ_FPR
+#
+# In offensive context: θ is the Jaccard anomaly threshold used to
+# trigger an alert/escalation during automated fuzzing campaigns.
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class OptConfig:
+    w1: float = 0.5          # weight: detection rate
+    w2: float = 0.3          # weight: false-positive rate
+    w3: float = 0.2          # weight: compute cost
+    delta_dr: float = 0.85   # min acceptable DR
+    delta_fpr: float = 0.10  # max acceptable FPR
+    theta_min: float = 0.0
+    theta_max: float = 1.0
+
+
+def F(theta: float,
+      dr_fn: Callable[[float], float],
+      fpr_fn: Callable[[float], float],
+      cost_fn: Callable[[float], float],
+      cfg: OptConfig) -> Optional[float]:
+    """Objective function – returns None if constraints violated."""
+    dr, fpr, cost = dr_fn(theta), fpr_fn(theta), cost_fn(theta)
+    if dr < cfg.delta_dr or fpr > cfg.delta_fpr:
+        return None
+    return cfg.w1 * dr - cfg.w2 * fpr - cfg.w3 * cost
+
+
+# ── PSO ────────────────────────────────────────────────────────────────────
+
+def pso(dr_fn, fpr_fn, cost_fn, cfg: OptConfig,
+        n: int = 40, iters: int = 150,
+        w: float = 0.72, c1: float = 1.49, c2: float = 1.49
+        ) -> Tuple[float, float]:
+    """Particle Swarm Optimisation for θ*."""
+    pos = [random.uniform(cfg.theta_min, cfg.theta_max) for _ in range(n)]
+    vel = [0.0] * n
+    pbest = pos[:]
+    pbest_score = [F(p, dr_fn, fpr_fn, cost_fn, cfg) or -1e9 for p in pos]
+
+    gbest = pbest[pbest_score.index(max(pbest_score))]
+    gbest_score = max(pbest_score)
+
+    for _ in range(iters):
+        for i in range(n):
+            r1, r2 = random.random(), random.random()
+            vel[i] = (w * vel[i]
+                      + c1 * r1 * (pbest[i] - pos[i])
+                      + c2 * r2 * (gbest     - pos[i]))
+            pos[i] = max(cfg.theta_min,
+                         min(cfg.theta_max, pos[i] + vel[i]))
+            s = F(pos[i], dr_fn, fpr_fn, cost_fn, cfg) or -1e9
+            if s > pbest_score[i]:
+                pbest[i], pbest_score[i] = pos[i], s
+            if s > gbest_score:
+                gbest, gbest_score = pos[i], s
+
+    return gbest, gbest_score
+
+
+# ── GWO ────────────────────────────────────────────────────────────────────
+
+def gwo(dr_fn, fpr_fn, cost_fn, cfg: OptConfig,
+        n: int = 40, iters: int = 150) -> Tuple[float, float]:
+    """Grey Wolf Optimiser for θ* (Mirjalili et al. 2014)."""
+    wolves = [random.uniform(cfg.theta_min, cfg.theta_max) for _ in range(n)]
+    scored = lambda w: F(w, dr_fn, fpr_fn, cost_fn, cfg) or -1e9
+
+    alpha, beta, delta = sorted(wolves, key=scored, reverse=True)[:3]
+    alpha_s = scored(alpha)
+
+    for it in range(iters):
+        a = 2.0 * (1 - it / iters)   # decreases 2 → 0
+        new_wolves = []
+        for w in wolves:
+            X1 = alpha - a * abs(2*random.random()*alpha - w) * (2*random.random()-1)
+            X2 = beta  - a * abs(2*random.random()*beta  - w) * (2*random.random()-1)
+            X3 = delta - a * abs(2*random.random()*delta - w) * (2*random.random()-1)
+            new_w = max(cfg.theta_min,
+                        min(cfg.theta_max, (X1 + X2 + X3) / 3))
+            new_wolves.append(new_w)
+        wolves = new_wolves
+        top3 = sorted(wolves, key=scored, reverse=True)[:3]
+        alpha, beta, delta = top3
+        alpha_s = scored(alpha)
+
+    return alpha, alpha_s
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN – End-to-End Offensive Research Pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+
+def demo_validators():
+    """
+    Mock validators for offline testing.
+    Replace with openssl_validator() + real library wrappers.
+    """
+    def v_strict(c: Cert) -> str:
+        if b"\x00" in c.data[:8]: return "REJECT"
+        if len(c.data) > 400:     return "REJECT"
+        if c.data[:2] != b"\x30\x82": return "REJECT"
+        return "ACCEPT"
+
+    def v_lenient(c: Cert) -> str:
+        return "REJECT" if len(c.data) < 4 else "ACCEPT"
+
+    def v_crashy(c: Cert) -> str:
+        if len(c.data) > 512:          return "CRASH"
+        if c.data[:1] != b"\x30":      return "REJECT"
+        return "ACCEPT"
+
+    return {"Strict": v_strict, "Lenient": v_lenient, "Crashy": v_crashy}
+
+
+if __name__ == "__main__":
+    print("╔══════════════════════════════════════════════════════════╗")
+    print("║  X.509 Offensive Fuzzing Pipeline  –  5-Module Run      ║")
+    print("╚══════════════════════════════════════════════════════════╝")
+
+    validators = demo_validators()
+    corpus = generate_edge_case_certs()
+
+    # ── Module 1: Differential Fuzzing Objective ─────────────────────────
+    print("\n▶ MODULE 1 – Differential Fuzzing Objective (Eq. 1–2)")
+    hits = sweep_corpus(validators, corpus)
+    print(f"  Divergent certs in seed corpus: {len(hits)}/{len(corpus)}")
+    for cert, results in hits:
+        print(f"    [{cert.label}]  {results}")
+
+    # ── Module 2: CGF Energy Markov Chain ────────────────────────────────
+    print("\n▶ MODULE 2 – CGF Energy / Markov Chain (Eq. 3–4)")
+    divergent = cgf_fuzz_loop(validators, corpus, iterations=300, alpha=1.0)
+    print(f"  Fuzz iterations: 300  |  New divergent mutants: {len(divergent)}")
+    for cert, results in divergent[:5]:
+        print(f"    [{cert.label}]  {results}")
+    if len(divergent) > 5:
+        print(f"    … and {len(divergent)-5} more")
+
+    # Build combined corpus for Jaccard analysis
+    all_certs = corpus + [c for c, _ in divergent]
+
+    # ── Module 3: Jaccard Distance ───────────────────────────────────────
+    print("\n▶ MODULE 3 – Jaccard Distance Metric (Eq. 5–6)")
+    matrix = pairwise_jaccard_matrix(validators, all_certs)
+    print_jaccard_report(matrix)
+
+    # ── Module 4: DGF Seed Distance ──────────────────────────────────────
+    print("\n▶ MODULE 4 – Directed GBF Distance (Eq. 7–8)")
+    seeds_with_traces = [
+        (FuzzSeed(cert=c, path_id=compute_path_id(c)),
+         # Simulate execution traces (in real use: collect via coverage tool)
+         random.sample(list(X509_CALL_GRAPH.keys()), k=3))
+        for c in corpus
+    ]
+    ranked = rank_seeds_by_distance(seeds_with_traces, DANGEROUS_TARGETS,
+                                    X509_CALL_GRAPH)
+    print(f"  Targets: {DANGEROUS_TARGETS}")
+    print("  Ranked seeds (closest to dangerous code first):")
+    for dist, seed in ranked:
+        print(f"    d_s={dist:.3f}  [{seed.cert.label}]")
+
+    # ── Module 5: Threshold Optimisation ─────────────────────────────────
+    print("\n▶ MODULE 5 – Metaheuristic Threshold Optimisation (Eq. 9)")
+
+    # Build empirical DR/FPR curves from Jaccard distances
+    dj_values = sorted(matrix.values())
+    mean_dj = sum(dj_values) / len(dj_values) if dj_values else 0.5
+
+    # Toy but data-informed DR/FPR functions
+    dr_fn   = lambda t: 1.0 / (1.0 + math.exp(-15 * (mean_dj - t)))
+    fpr_fn  = lambda t: max(0.0, 0.05 + 0.4 * t)
+    cost_fn = lambda t: t
+
+    cfg = OptConfig(w1=0.5, w2=0.3, w3=0.2, delta_dr=0.80, delta_fpr=0.15)
+
+    theta_pso, f_pso = pso(dr_fn, fpr_fn, cost_fn, cfg)
+    theta_gwo, f_gwo = gwo(dr_fn, fpr_fn, cost_fn, cfg)
+
+    print(f"  PSO  → optimal θ* = {theta_pso:.4f}   F = {f_pso:.4f}")
+    print(f"  GWO  → optimal θ* = {theta_gwo:.4f}   F = {f_gwo:.4f}")
+    print(f"  Recommended Jaccard alert threshold: "
+          f"{(theta_pso+theta_gwo)/2:.4f}")
+
+    print("\n✔  Pipeline complete.")
+    print("   Replace demo_validators() with real library subprocess calls")
+    print("   (openssl_validator shown above) for live target assessment.\n")
